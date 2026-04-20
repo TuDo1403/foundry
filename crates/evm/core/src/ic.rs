@@ -9,12 +9,15 @@ use serde::Serialize;
 #[serde(transparent)]
 pub struct PcIcMap {
     inner: FxHashMap<u32, u32>,
+    #[serde(skip)]
+    sorted_pcs: Vec<u32>,
 }
 
 impl PcIcMap {
     /// Creates a new `PcIcMap` for the given code.
     pub fn new(code: &[u8]) -> Self {
-        Self { inner: make_map::<true>(code) }
+        let sorted_pcs = InstIter::new(code).with_pc().map(|(pc, _)| pc as u32).collect::<Vec<_>>();
+        Self { inner: make_map::<true>(code), sorted_pcs }
     }
 
     /// Returns the length of the map.
@@ -32,9 +35,31 @@ impl PcIcMap {
         self.inner.get(&pc).copied()
     }
 
+    /// Returns the instruction counter for the largest program counter that does not exceed `pc`.
+    pub fn get_nearest(&self, pc: u32) -> Option<u32> {
+        let idx = self.sorted_pcs.partition_point(|mapped_pc| *mapped_pc <= pc);
+        (idx > 0).then(|| self.get(self.sorted_pcs[idx - 1])).flatten()
+    }
+
     /// Iterate over the PC-IC pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&u32, &u32)> {
         self.inner.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PcIcMap;
+
+    #[test]
+    fn nearest_pc_lookup_uses_preceding_instruction() {
+        let map = PcIcMap::new(&[0x60, 0xaa, 0x5b, 0x00]);
+
+        assert_eq!(map.get(0), Some(0));
+        assert_eq!(map.get_nearest(1), Some(0));
+        assert_eq!(map.get_nearest(2), Some(1));
+        assert_eq!(map.get_nearest(3), Some(2));
+        assert_eq!(map.get_nearest(u32::MAX), Some(2));
     }
 }
 

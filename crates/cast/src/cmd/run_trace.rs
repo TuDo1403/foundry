@@ -25,6 +25,7 @@ use foundry_evm::traces::{
         build_rpc_trace_arena, finalize_rpc_trace_arena, graft_local_replay_onto_call_tracer,
     },
 };
+use foundry_evm::{hardforks::FoundryHardfork, revm::primitives::hardfork::SpecId};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -202,6 +203,7 @@ impl RunTraceArgs {
         if let Some(warning) = raw.struct_trace_warning.clone() {
             warnings.push(warning);
         }
+        let refund_quotient = self.rpc_refund_quotient(&provider, &raw).await?;
 
         let (mut result, mut mode_warnings, contracts_bytecode) = if let (
             Some(call_trace),
@@ -217,8 +219,12 @@ impl RunTraceArgs {
             })?;
 
             let receipt_gas = gas_used_from_receipt(&raw.receipt).unwrap_or(default_frame.gas);
-            let mut converted =
-                build_rpc_trace_arena(&call_frame, &default_frame, self.trace_printer);
+            let mut converted = build_rpc_trace_arena(
+                &call_frame,
+                &default_frame,
+                self.trace_printer,
+                refund_quotient,
+            );
             let mut warnings = Vec::new();
             warnings.append(&mut converted.warnings);
             finalize_rpc_trace_arena(&mut converted.arena.arena, receipt_gas, &mut warnings);
@@ -742,6 +748,45 @@ impl RunTraceArgs {
             ))
         })
     }
+
+    async fn rpc_refund_quotient<P, N>(&self, provider: &P, raw: &RawRpcTraceCache) -> Result<u64>
+    where
+        P: Provider<N>,
+        N: Network,
+    {
+        let Some(timestamp) = self.rpc_trace_block_timestamp(provider, raw).await? else {
+            return Ok(5);
+        };
+        let Some(hardfork) = FoundryHardfork::from_chain_and_timestamp(raw.chain_id, timestamp)
+        else {
+            return Ok(5);
+        };
+
+        Ok(if is_post_london_spec(hardfork.into()) { 5 } else { 2 })
+    }
+
+    async fn rpc_trace_block_timestamp<P, N>(
+        &self,
+        provider: &P,
+        raw: &RawRpcTraceCache,
+    ) -> Result<Option<u64>>
+    where
+        P: Provider<N>,
+        N: Network,
+    {
+        if let Some(timestamp) = block_timestamp_from_block(&raw.block) {
+            return Ok(Some(timestamp));
+        }
+
+        let Some(block_number) = block_number_from_tx(&raw.tx) else {
+            return Ok(None);
+        };
+        let block_number_hex = format!("0x{block_number:x}");
+        let block: Option<Value> = provider
+            .raw_request(Cow::Borrowed("eth_getBlockByNumber"), (block_number_hex, false))
+            .await?;
+        Ok(block.as_ref().and_then(block_timestamp_from_block))
+    }
 }
 
 fn raw_rpc_cache_tracer_key(storage_values: bool, enable_memory: bool) -> &'static str {
@@ -852,6 +897,14 @@ fn gas_used_from_receipt(receipt: &Value) -> Option<u64> {
 
 fn block_number_from_tx(tx: &Value) -> Option<u64> {
     quantity_to_u64(tx.get("blockNumber")?)
+}
+
+fn block_timestamp_from_block(block: &Value) -> Option<u64> {
+    quantity_to_u64(block.get("timestamp")?)
+}
+
+fn is_post_london_spec(spec_id: SpecId) -> bool {
+    (spec_id as u8) >= (SpecId::LONDON as u8)
 }
 
 fn quantity_to_u64(value: &Value) -> Option<u64> {
