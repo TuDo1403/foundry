@@ -3,6 +3,8 @@
 FROM rust:1-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS chef
 WORKDIR /app
 
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
 RUN apt update && apt install -y build-essential libssl-dev git pkg-config curl perl
 RUN set -eux; \
     BINSTALL_VERSION="v1.18.1"; \
