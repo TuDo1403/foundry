@@ -17,7 +17,7 @@ RUN set -eux; \
     echo "${SHA256}  /tmp/cargo-binstall.tgz" | sha256sum -c -; \
     tar -xzf /tmp/cargo-binstall.tgz -C /usr/local/cargo/bin cargo-binstall; \
     rm /tmp/cargo-binstall.tgz
-RUN cargo binstall -y cargo-chef sccache
+RUN cargo binstall -y cargo-chef
 
 # Prepare the cargo-chef recipe.
 FROM chef AS planner
@@ -31,14 +31,11 @@ COPY --from=planner /app/recipe.json recipe.json
 ARG RUST_PROFILE
 ARG RUST_FEATURES
 
-ENV CARGO_INCREMENTAL=0 \
-    RUSTC_WRAPPER=sccache \
-    SCCACHE_DIR=/sccache
+ENV CARGO_INCREMENTAL=0
 
 # Build dependencies.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
-    --mount=type=cache,target=$SCCACHE_DIR,sharing=shared \
     cargo chef cook --recipe-path recipe.json --profile ${RUST_PROFILE} --no-default-features --features "${RUST_FEATURES}"
 
 ARG TAG_NAME="dev"
@@ -50,9 +47,7 @@ ENV VERGEN_GIT_SHA=$VERGEN_GIT_SHA
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
-    --mount=type=cache,target=$SCCACHE_DIR,sharing=shared \
-    cargo build --profile ${RUST_PROFILE} --no-default-features --features "${RUST_FEATURES}" \
-    && sccache --show-stats || true
+    cargo build --profile ${RUST_PROFILE} --no-default-features --features "${RUST_FEATURES}"
 
 # `dev` profile outputs to the `target/debug` directory.
 RUN ln -s /app/target/debug /app/target/dev \
@@ -76,6 +71,10 @@ RUN groupadd -g 1000 foundry && \
 USER foundry
 
 ENTRYPOINT ["/bin/sh", "-c"]
+
+ARG BUILD_DATE=""
+ARG VCS_REF=""
+ARG VERSION="dev"
 
 LABEL org.label-schema.build-date=$BUILD_DATE \
       org.label-schema.name="Foundry" \

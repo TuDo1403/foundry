@@ -71,11 +71,13 @@ jobs:
 
           TAG_SAFE="${TAG//\//-}"
           IMAGE_NAME="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           {
             printf 'tag=%s\n' "$TAG_SAFE"
             printf 'profile=%s\n' "$PROFILE"
             printf 'features=%s\n' "$FEATURES"
             printf 'image_name=%s\n' "$IMAGE_NAME"
+            printf 'build_date=%s\n' "$BUILD_DATE"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
@@ -93,3 +95,6 @@ jobs:
             RUST_FEATURES=${{ steps.vars.outputs.features }}
             TAG_NAME=${{ steps.vars.outputs.tag }}
             VERGEN_GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.vars.outputs.build_date }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.vars.outputs.tag }}
