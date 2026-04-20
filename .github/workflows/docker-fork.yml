@@ -1,0 +1,89 @@
+name: docker-fork
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Docker tag to publish
+        required: true
+        default: custom
+        type: string
+      rust_profile:
+        description: Cargo profile passed to Dockerfile
+        required: true
+        default: dist
+        type: string
+      rust_features:
+        description: Comma-separated feature list passed to Dockerfile
+        required: true
+        default: aws-kms,gcp-kms,turnkey,cli,asm-keccak,js-tracer
+        type: string
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEFAULT_RUST_PROFILE: dist
+  DEFAULT_RUST_FEATURES: aws-kms,gcp-kms,turnkey,cli,asm-keccak,js-tracer
+
+jobs:
+  docker:
+    name: build and push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve build inputs
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.image_tag }}"
+            PROFILE="${{ inputs.rust_profile }}"
+            FEATURES="${{ inputs.rust_features }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            PROFILE="${DEFAULT_RUST_PROFILE}"
+            FEATURES="${DEFAULT_RUST_FEATURES}"
+          fi
+
+          TAG_SAFE="${TAG//\//-}"
+          {
+            printf 'tag=%s\n' "$TAG_SAFE"
+            printf 'profile=%s\n' "$PROFILE"
+            printf 'features=%s\n' "$FEATURES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          build-args: |
+            RUST_PROFILE=${{ steps.vars.outputs.profile }}
+            RUST_FEATURES=${{ steps.vars.outputs.features }}
+            TAG_NAME=${{ steps.vars.outputs.tag }}
+            VERGEN_GIT_SHA=${{ github.sha }}

@@ -176,7 +176,11 @@ impl RuntimeTransport {
     pub fn reqwest_client(&self) -> Result<reqwest::Client, RuntimeTransportError> {
         let mut client_builder = reqwest::Client::builder()
             .timeout(self.timeout)
-            .danger_accept_invalid_certs(self.accept_invalid_certs);
+            .danger_accept_invalid_certs(self.accept_invalid_certs)
+            .gzip(true)
+            .brotli(true)
+            .zstd(true)
+            .deflate(true);
 
         // Disable automatic proxy detection if requested. This helps in sandboxed environments
         // (e.g., Cursor IDE sandbox, macOS App Sandbox) where system proxy detection via

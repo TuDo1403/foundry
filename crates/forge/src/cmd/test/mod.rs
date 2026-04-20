@@ -12,7 +12,7 @@ use crate::{
         identifier::SignaturesIdentifier,
     },
 };
-use alloy_primitives::U256;
+use alloy_primitives::{Selector, U256, map::HashMap};
 use chrono::Utc;
 use clap::{Parser, ValueHint};
 use eyre::{Context, OptionExt, Result, bail};
@@ -20,7 +20,9 @@ use foundry_cli::{
     opts::{BuildOpts, EvmArgs, GlobalArgs},
     utils::{self, LoadConfig},
 };
-use foundry_common::{EmptyTestFilter, TestFunctionExt, compile::ProjectCompiler, fs, shell};
+use foundry_common::{
+    ContractsByArtifact, EmptyTestFilter, TestFunctionExt, compile::ProjectCompiler, fs, shell,
+};
 use foundry_compilers::{
     ProjectCompileOutput,
     artifacts::{Libraries, output_selection::OutputSelection},
@@ -65,6 +67,23 @@ use crate::{result::TestKind, traces::render_trace_arena_inner};
 pub use filter::FilterArgs;
 use quick_junit::{NonSuccessKind, Report, TestCase, TestCaseStatus, TestSuite};
 use summary::{TestSummaryReport, format_invariant_metrics_table};
+
+fn build_selector_candidates(contracts: &ContractsByArtifact) -> HashMap<Selector, Vec<String>> {
+    let mut selector_candidates = HashMap::default();
+    for (id, contract) in contracts.iter() {
+        for function in contract.abi.functions() {
+            selector_candidates
+                .entry(function.selector())
+                .or_insert_with(Vec::new)
+                .push(id.name.clone());
+        }
+    }
+    for candidates in selector_candidates.values_mut() {
+        candidates.sort();
+        candidates.dedup();
+    }
+    selector_candidates
+}
 
 // Loads project's figment and merges the build cli arguments into it
 foundry_config::merge_impl_figment_convert!(TestArgs, build, evm);
@@ -620,7 +639,10 @@ impl TestArgs {
         if self.decode_internal {
             let sources =
                 ContractSources::from_project_output(output, &config.root, Some(&libraries))?;
-            builder = builder.with_debug_identifier(DebugTraceIdentifier::new(sources));
+            builder = builder.with_debug_identifier(
+                DebugTraceIdentifier::new(sources)
+                    .with_selector_candidates(build_selector_candidates(&known_contracts)),
+            );
         }
         let mut decoder = builder.build();
 

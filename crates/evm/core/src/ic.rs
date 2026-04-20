@@ -31,6 +31,11 @@ impl PcIcMap {
     pub fn get(&self, pc: u32) -> Option<u32> {
         self.inner.get(&pc).copied()
     }
+
+    /// Iterate over the PC-IC pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &u32)> {
+        self.inner.iter()
+    }
 }
 
 /// Map from instruction counter to program counter.

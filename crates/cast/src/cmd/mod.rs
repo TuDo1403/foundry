@@ -26,6 +26,7 @@ pub(crate) mod miner;
 pub mod mktx;
 pub mod rpc;
 pub mod run;
+mod run_trace;
 pub mod send;
 pub mod storage;
 pub mod tip20;

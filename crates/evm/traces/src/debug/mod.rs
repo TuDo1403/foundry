@@ -2,9 +2,9 @@ mod sources;
 use crate::CallTraceNode;
 use alloy_dyn_abi::{
     DynSolType, DynSolValue, Specifier,
-    parser::{Parameters, Storage},
+    parser::{ParameterSpecifier, Parameters, Storage},
 };
-use alloy_primitives::U256;
+use alloy_primitives::{Address, Selector, U256, map::HashMap};
 use foundry_common::fmt::format_token;
 use foundry_compilers::artifacts::sourcemap::{Jump, SourceElement};
 use revm::bytecode::opcode::OpCode;
@@ -15,11 +15,49 @@ pub use sources::{ArtifactData, ContractSources, SourceData};
 pub struct DebugTraceIdentifier {
     /// Source map of contract sources
     contracts_sources: ContractSources,
+    /// Selector -> candidate contract names from the local artifacts.
+    selector_candidates: HashMap<Selector, Vec<String>>,
+    /// Exact runtime-bytecode matches for traced addresses.
+    exact_runtime_candidates: HashMap<Address, Vec<String>>,
 }
 
 impl DebugTraceIdentifier {
-    pub const fn new(contracts_sources: ContractSources) -> Self {
-        Self { contracts_sources }
+    pub fn new(contracts_sources: ContractSources) -> Self {
+        Self {
+            contracts_sources,
+            selector_candidates: HashMap::default(),
+            exact_runtime_candidates: HashMap::default(),
+        }
+    }
+
+    pub fn with_selector_candidates(
+        mut self,
+        selector_candidates: HashMap<Selector, Vec<String>>,
+    ) -> Self {
+        self.selector_candidates = selector_candidates;
+        self
+    }
+
+    pub fn with_exact_runtime_candidates(
+        mut self,
+        exact_runtime_candidates: HashMap<Address, Vec<String>>,
+    ) -> Self {
+        self.exact_runtime_candidates = exact_runtime_candidates;
+        self
+    }
+
+    pub fn has_exact_runtime_match(&self, address: Address) -> bool {
+        self.exact_runtime_candidates.contains_key(&address)
+    }
+
+    pub fn preferred_contract_name(
+        &self,
+        node: &CallTraceNode,
+        identified_contract_name: Option<&str>,
+    ) -> Option<String> {
+        self.exact_runtime_contract_name(node, identified_contract_name)
+            .or_else(|| identified_contract_name.map(str::to_string))
+            .or_else(|| self.infer_contract_name(node))
     }
 
     /// Identifies internal function invocations in a given [CallTraceNode].
@@ -27,6 +65,106 @@ impl DebugTraceIdentifier {
     /// Accepts the node itself and identified name of the contract which node corresponds to.
     pub fn identify_node_steps(&self, node: &mut CallTraceNode, contract_name: &str) {
         DebugStepsWalker::new(node, &self.contracts_sources, contract_name).walk();
+    }
+
+    fn exact_runtime_contract_name(
+        &self,
+        node: &CallTraceNode,
+        identified_contract_name: Option<&str>,
+    ) -> Option<String> {
+        let candidates = self.exact_runtime_candidates.get(&node.trace.address)?;
+
+        if let Some(identified_contract_name) = identified_contract_name
+            && candidates.iter().any(|candidate| candidate == identified_contract_name)
+        {
+            return Some(identified_contract_name.to_string());
+        }
+
+        if candidates.len() == 1 {
+            return Some(candidates[0].clone());
+        }
+
+        self.infer_contract_name_from_candidates(node, candidates.iter().map(String::as_str))
+    }
+
+    /// Best-effort inference for frames whose runtime bytecode did not match a local artifact.
+    ///
+    /// This samples program counters from the frame and looks for the contract whose source maps
+    /// cover the most steps, biasing toward contracts that also contain the externally-decoded
+    /// function name. This lets `run --trace` recover inherited/library internals even when the
+    /// deployed bytecode is not an exact local match.
+    pub fn infer_contract_name(&self, node: &CallTraceNode) -> Option<String> {
+        self.infer_contract_name_from_candidates(
+            node,
+            self.contracts_sources.entries().map(|(contract_name, _, _)| contract_name),
+        )
+    }
+
+    fn infer_contract_name_from_candidates<'a>(
+        &self,
+        node: &CallTraceNode,
+        contract_names: impl IntoIterator<Item = &'a str>,
+    ) -> Option<String> {
+        if node.trace.steps.is_empty() {
+            return None;
+        }
+
+        let function_name = external_function_name(node);
+        let selector_candidates =
+            node.selector().and_then(|selector| self.selector_candidates.get(&selector));
+        let sampled_pcs = sample_step_pcs(&node.trace.steps, 16);
+        let init_code = node.trace.kind.is_any_create();
+        let mut best_match: Option<(usize, usize, &str)> = None;
+        let contract_names: Vec<&str> = contract_names.into_iter().collect();
+
+        for (contract_name, _, source) in self.contracts_sources.entries() {
+            if !contract_names.is_empty() && !contract_names.contains(&contract_name) {
+                continue;
+            }
+            if let Some(selector_candidates) = selector_candidates
+                && !selector_candidates.iter().any(|candidate| candidate == contract_name)
+            {
+                continue;
+            }
+            if is_non_runtime_source(&source.path) {
+                continue;
+            }
+
+            let mut mapped_steps = 0usize;
+            let mut function_hits = 0usize;
+
+            for pc in &sampled_pcs {
+                let Some((source_element, mapped_source)) = self
+                    .contracts_sources
+                    .find_source_mapping(contract_name, *pc as u32, init_code)
+                else {
+                    continue;
+                };
+                mapped_steps += 1;
+
+                if let Some(function_name) = function_name
+                    && source_span(
+                        &mapped_source.source,
+                        source_element.offset() as usize,
+                        source_element.length() as usize,
+                    )
+                    .is_some_and(|(source_part, _)| source_part.contains(function_name))
+                {
+                    function_hits += 1;
+                }
+            }
+
+            if mapped_steps == 0 {
+                continue;
+            }
+
+            let current = (function_hits, mapped_steps, contract_name);
+            if best_match.is_none_or(|best| current > best) {
+                best_match = Some(current);
+            }
+        }
+
+        best_match.map(|(_, _, contract_name)| contract_name.to_string())
     }
 }
 
@@ -211,6 +349,45 @@ fn parse_function_from_loc(source: &SourceData, loc: &SourceElement) -> Option<S
     Some(format!("{contract_name}::{function_name}"))
 }
 
+fn external_function_name(node: &CallTraceNode) -> Option<&str> {
+    let signature = node.trace.decoded.as_deref()?.call_data.as_ref()?.signature.as_str();
+    let name = signature.split_once('(').map(|(name, _)| name).unwrap_or(signature);
+    if name.is_empty() || name == "fallback" || name.starts_with("0x") {
+        return None;
+    }
+    Some(name)
+}
+
+fn sample_step_pcs(steps: &[CallTraceStep], max_samples: usize) -> Vec<usize> {
+    if steps.is_empty() {
+        return Vec::new();
+    }
+    if steps.len() <= max_samples {
+        return steps.iter().map(|step| step.pc).collect();
+    }
+
+    let last = steps.len() - 1;
+    let mut pcs = Vec::with_capacity(max_samples);
+    for idx in 0..max_samples {
+        let step_idx = idx * last / (max_samples - 1);
+        let pc = steps[step_idx].pc;
+        if pcs.last().copied() != Some(pc) {
+            pcs.push(pc);
+        }
+    }
+    pcs
+}
+
+fn is_non_runtime_source(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        let component = component.as_os_str().to_string_lossy();
+        matches!(
+            component.as_ref(),
+            "test" | "tests" | "script" | "scripts" | "benchmark" | "benchmarks"
+        )
+    })
+}
+
 fn source_span(source: &str, start: usize, len: usize) -> Option<(&str, usize)> {
     let end = start.checked_add(len)?;
 
@@ -240,45 +417,86 @@ fn try_decode_args_from_step(args: &Parameters<'_>, step: &CallTraceStep) -> Opt
         return Some(vec![]);
     }
 
-    let types = params.iter().map(|p| p.resolve().ok().map(|t| (t, p.storage))).collect::<Vec<_>>();
-
     let stack = step.stack.as_ref()?;
 
-    if stack.len() < types.len() {
+    if stack.len() < params.len() {
         return None;
     }
 
-    let inputs = &stack[stack.len() - types.len()..];
+    let inputs = &stack[stack.len() - params.len()..];
 
     let decoded = inputs
         .iter()
-        .zip(types.iter())
-        .map(|(input, type_and_storage)| {
-            type_and_storage
-                .as_ref()
-                .and_then(|(type_, storage)| {
-                    match (type_, storage) {
+        .zip(params.iter())
+        .map(|(input, param)| {
+            if param.storage.is_none() && is_user_defined_type(param.ty.span()) {
+                return format_unresolved_arg(param, input);
+            }
+
+            param
+                .resolve()
+                .ok()
+                .and_then(|type_| {
+                    match (type_, param.storage) {
                         // HACK: alloy parser treats user-defined types as uint8: https://github.com/alloy-rs/core/pull/386
                         //
                         // filter out `uint8` params which are marked as storage or memory as this
                         // is not possible in Solidity and means that type is user-defined
                         (DynSolType::Uint(8), Some(Storage::Memory | Storage::Storage)) => None,
-                        (_, Some(Storage::Memory)) => decode_from_memory(
-                            type_,
+                        (type_, Some(Storage::Memory)) => decode_from_memory(
+                            &type_,
                             step.memory.as_ref()?.as_bytes(),
                             input.try_into().ok()?,
                         ),
                         // Read other types from stack
-                        _ => type_.abi_decode(&input.to_be_bytes::<32>()).ok(),
+                        (type_, _) => type_.abi_decode(&input.to_be_bytes::<32>()).ok(),
                     }
                 })
                 .as_ref()
                 .map(format_token)
-                .unwrap_or_else(|| "<unknown>".to_string())
+                .unwrap_or_else(|| format_unresolved_arg(param, input))
         })
         .collect();
 
     Some(decoded)
+}
+
+fn format_unresolved_arg(param: &ParameterSpecifier<'_>, input: &U256) -> String {
+    let raw = format_stack_word(input);
+    let ty = param.ty.span();
+
+    match param.storage {
+        Some(Storage::Storage) => format!("{ty} storage@{raw}"),
+        Some(Storage::Memory) => format!("{ty} memory@{raw}"),
+        Some(Storage::Calldata) => format!("{ty} calldata@{raw}"),
+        None if is_user_defined_type(ty) || param.resolve().is_err() => format!("{ty}.wrap({raw})"),
+        None => raw,
+    }
+}
+
+fn format_stack_word(input: &U256) -> String {
+    format!("0x{input:064x}")
+}
+
+fn is_user_defined_type(ty: &str) -> bool {
+    let root = ty.split('[').next().unwrap_or(ty);
+    if root.starts_with('(') {
+        return false;
+    }
+
+    if matches!(root, "address" | "bool" | "string" | "bytes" | "function" | "uint" | "int") {
+        return false;
+    }
+
+    if let Some(size) = root.strip_prefix("bytes") {
+        return size.parse::<u16>().is_err();
+    }
+    let numeric_size = root.strip_prefix("uint").or_else(|| root.strip_prefix("int"));
+    if let Some(size) = numeric_size {
+        return size.parse::<u16>().is_err();
+    }
+
+    true
 }
 
 /// Decodes given [DynSolType] from memory.
@@ -332,12 +550,67 @@ fn decode_from_memory(ty: &DynSolType, memory: &[u8], location: usize) -> Option
 
 #[cfg(test)]
 mod tests {
-    use super::source_span;
+    use super::{source_span, try_decode_args_from_step};
+    use alloy_dyn_abi::parser::Parameters;
+    use alloy_primitives::U256;
+    use revm::bytecode::opcode::OpCode;
+    use revm_inspectors::tracing::types::CallTraceStep;
 
     #[test]
     fn source_span_returns_none_for_invalid_ranges() {
         assert_eq!(source_span("abcdef", 2, 3), Some(("cde", 5)));
         assert_eq!(source_span("abcdef", 7, 1), None);
         assert_eq!(source_span("abcdef", usize::MAX, 1), None);
+    }
+
+    #[test]
+    fn unresolved_udvt_args_fall_back_to_wrapped_stack_word() {
+        let slot = U256::from_be_slice(&[0x11; 32]);
+        let args = Parameters::parse("(TransientSlot.BooleanSlot slot, bool value)").unwrap();
+        let step = CallTraceStep {
+            stack: Some(vec![slot, U256::from(1)].into_boxed_slice()),
+            ..empty_step()
+        };
+
+        let decoded = try_decode_args_from_step(&args, &step).unwrap();
+        assert_eq!(
+            decoded,
+            vec![format!("TransientSlot.BooleanSlot.wrap(0x{:064x})", slot), "true".to_string(),]
+        );
+    }
+
+    #[test]
+    fn unresolved_storage_args_fall_back_to_typed_slot_pointer() {
+        let slot = U256::from(0x1234);
+        let args = Parameters::parse("(PerpsMarketStorage storage self, uint16 marketId)").unwrap();
+        let step = CallTraceStep {
+            stack: Some(vec![slot, U256::from(4)].into_boxed_slice()),
+            ..empty_step()
+        };
+
+        let decoded = try_decode_args_from_step(&args, &step).unwrap();
+        assert_eq!(
+            decoded,
+            vec![format!("PerpsMarketStorage storage@0x{:064x}", slot), "4".to_string()]
+        );
+    }
+
+    fn empty_step() -> CallTraceStep {
+        CallTraceStep {
+            pc: 0,
+            op: OpCode::STOP,
+            stack: None,
+            push_stack: None,
+            memory: None,
+            returndata: Default::default(),
+            gas_remaining: 0,
+            gas_refund_counter: 0,
+            gas_used: 0,
+            gas_cost: 0,
+            storage_change: None,
+            status: None,
+            immediate_bytes: None,
+            decoded: None,
+        }
     }
 }

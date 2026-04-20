@@ -18,7 +18,7 @@ use foundry_test_utils::{
     str,
     util::OutputExt,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{fs, path::Path, str::FromStr};
 
 #[macro_use]
@@ -4745,6 +4745,37 @@ Transaction successfully executed.
 "#]]);
     }
 );
+
+casttest!(
+    #[ignore = "requires RISE_RPC_URL with debug_traceTransaction support"]
+    run_trace_rise_smoke,
+    |_prj, cmd| {
+        let rpc = std::env::var("RISE_RPC_URL").expect("set RISE_RPC_URL");
+        let mut args = vec![
+            "run".to_string(),
+            "0x296fccbf5246af0dbd964fdaf698d8c16f1841159385116818c345deea92fb76".to_string(),
+            "--trace".to_string(),
+            "--rpc-url".to_string(),
+            rpc,
+            "--profile".to_string(),
+            "--json".to_string(),
+        ];
+        if let Ok(cache) = std::env::var("RISE_TRACE_RPC_CACHE") {
+            args.push("--raw-rpc-cache".to_string());
+            args.push(cache);
+        }
+
+        let output = cmd.args(args).assert_success().get_output().stdout_lossy();
+        let value: Value = serde_json::from_str(&output).expect("run --trace emits json");
+
+        assert!(value.get("schemaVersion").is_none());
+        assert!(value.get("chainId").is_none());
+        assert!(value.get("profiles").is_none());
+        assert!(value.get("warnings").is_none());
+        assert_eq!(value["arena"][0]["trace"]["gas_used"], 1_331_363);
+    }
+);
+
 casttest!(keccak_stdin_bytes, |_prj, cmd| {
     cmd.args(["keccak"]).stdin("0x12").assert_success().stdout_eq(str![[r#"
 0x5fa2358263196dbbf23d1ca7a509451f7a2f64c15837bfbb81298b1e3e24e4fa

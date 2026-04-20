@@ -54,6 +54,9 @@ pub mod folded_stack_trace;
 
 pub mod backtrace;
 
+pub mod rpc_profile;
+pub mod rpc_trace;
+
 pub type Traces = Vec<(TraceKind, SparsedTraceArena)>;
 
 /// Trace arena keeping track of ignored trace items.

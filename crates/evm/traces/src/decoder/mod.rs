@@ -427,10 +427,25 @@ impl CallTraceDecoder {
                 log.decoded = Some(Box::new(self.decode_event(&log.raw_log).await));
             }
 
-            if let Some(debug) = self.debug_identifier.as_ref()
-                && let Some(identified) = self.contracts.get(&node.trace.address)
-            {
-                debug.identify_node_steps(node, get_contract_name(identified))
+            if let Some(debug) = self.debug_identifier.as_ref() {
+                let identified_contract_name = self
+                    .contracts
+                    .get(&node.trace.address)
+                    .map(|identified| get_contract_name(identified.as_str()));
+                let contract_name = debug.preferred_contract_name(node, identified_contract_name);
+
+                if let Some(contract_name) = contract_name {
+                    if let Some(decoded) = node.trace.decoded.as_mut()
+                        && (decoded.label.is_none()
+                            || (debug.has_exact_runtime_match(node.trace.address)
+                                && identified_contract_name.is_some_and(|identified| {
+                                    decoded.label.as_deref() == Some(identified)
+                                })))
+                    {
+                        decoded.label = Some(contract_name.clone());
+                    }
+                    debug.identify_node_steps(node, &contract_name);
+                }
             }
         }
     }
