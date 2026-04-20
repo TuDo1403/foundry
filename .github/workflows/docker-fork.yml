@@ -20,6 +20,7 @@ on:
         type: string
   push:
     branches:
+      - main
       - master
 
 permissions:
@@ -59,6 +60,10 @@ jobs:
             TAG="${{ inputs.image_tag }}"
             PROFILE="${{ inputs.rust_profile }}"
             FEATURES="${{ inputs.rust_features }}"
+          elif [[ "${GITHUB_REF_NAME}" == "main" || "${GITHUB_REF_NAME}" == "master" ]]; then
+            TAG="latest"
+            PROFILE="${DEFAULT_RUST_PROFILE}"
+            FEATURES="${DEFAULT_RUST_FEATURES}"
           else
             TAG="${GITHUB_REF_NAME}"
             PROFILE="${DEFAULT_RUST_PROFILE}"
