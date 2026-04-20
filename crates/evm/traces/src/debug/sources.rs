@@ -310,9 +310,5 @@ impl ContractSources {
 }
 
 fn nearest_instruction_counter(pc_ic_map: &PcIcMap, pc: u32) -> Option<u32> {
-    pc_ic_map
-        .iter()
-        .filter_map(|(mapped_pc, ic)| (*mapped_pc <= pc).then_some((*mapped_pc, *ic)))
-        .max_by_key(|(mapped_pc, _)| *mapped_pc)
-        .map(|(_, ic)| ic)
+    pc_ic_map.get_nearest(pc)
 }

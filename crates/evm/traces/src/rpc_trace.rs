@@ -71,13 +71,20 @@ pub fn build_rpc_trace_arena(
     call_frame: &CallFrame,
     default_frame: &DefaultFrame,
     trace_printer: bool,
+    refund_quotient: u64,
 ) -> RpcTraceArena {
     let mut arena = CallTraceArena::default();
     let mut warnings = Vec::new();
     let root_idx = push_call_frame(&mut arena, None, call_frame, 0);
     debug_assert_eq!(root_idx, 0);
 
-    assign_struct_logs(&mut arena, &default_frame.struct_logs, trace_printer, &mut warnings);
+    assign_struct_logs(
+        &mut arena,
+        &default_frame.struct_logs,
+        trace_printer,
+        refund_quotient,
+        &mut warnings,
+    );
     append_unvisited_children(&mut arena);
     append_call_logs(&mut arena, call_frame);
 
@@ -94,7 +101,7 @@ pub fn graft_local_replay_onto_call_tracer(
         return None;
     }
 
-    let mut merged = build_rpc_trace_arena(call_frame, &DefaultFrame::default(), false);
+    let mut merged = build_rpc_trace_arena(call_frame, &DefaultFrame::default(), false, 5);
     if !nodes_match_relaxed(&merged.arena.arena.nodes()[0], &local.nodes()[0]) {
         push_unique_warning(
             &mut merged.warnings,
@@ -197,7 +204,8 @@ fn json_call_from_node(node: &CallTraceNode) -> RpcJsonCall {
 }
 
 fn gas_between_steps(start: &CallTraceStep, end: &CallTraceStep) -> u64 {
-    end.gas_used.saturating_sub(start.gas_used)
+    let remaining_delta = start.gas_remaining.saturating_sub(end.gas_remaining);
+    if remaining_delta == 0 { end.gas_used.saturating_sub(start.gas_used) } else { remaining_delta }
 }
 
 fn graft_local_node(
@@ -446,6 +454,7 @@ fn assign_struct_logs(
     arena: &mut CallTraceArena,
     logs: &[StructLog],
     trace_printer: bool,
+    refund_quotient: u64,
     warnings: &mut Vec<String>,
 ) {
     if logs.is_empty() {
@@ -484,8 +493,12 @@ fn assign_struct_logs(
 
         let node_idx = active.get(call_depth).copied().unwrap_or_else(|| *active.last().unwrap());
         let entry_gas = initial_gas[node_idx].get_or_insert(log.gas);
-        let gas_used =
-            rpc_step_gas_used(*entry_gas, log.gas, log.refund_counter.unwrap_or_default());
+        let gas_used = rpc_step_gas_used(
+            *entry_gas,
+            log.gas,
+            log.refund_counter.unwrap_or_default(),
+            refund_quotient,
+        );
         let step = struct_log_to_step(log, trace_printer, warnings, gas_used);
         let step_idx = arena.nodes()[node_idx].trace.steps.len();
         let node = &mut arena.nodes_mut()[node_idx];
@@ -494,12 +507,15 @@ fn assign_struct_logs(
     }
 }
 
-fn rpc_step_gas_used(initial_gas: u64, gas_remaining: u64, refund_counter: u64) -> u64 {
+fn rpc_step_gas_used(
+    initial_gas: u64,
+    gas_remaining: u64,
+    refund_counter: u64,
+    refund_quotient: u64,
+) -> u64 {
     let spent = initial_gas.saturating_sub(gas_remaining);
-
-    // RPC struct logs do not expose the active hardfork, so use the post-London refund cap that
-    // matches modern chains and Foundry's local replay for current transactions.
-    spent.saturating_sub(refund_counter.min(spent / 5))
+    let refund_quotient = refund_quotient.max(1);
+    spent.saturating_sub(refund_counter.min(spent / refund_quotient))
 }
 
 fn validate_trace_arena(arena: &CallTraceArena, warnings: &mut Vec<String>) {
@@ -662,7 +678,11 @@ fn parse_call_kind(kind: &str) -> CallKind {
 }
 
 fn storage_address(node: &CallTraceNode) -> Address {
-    if node.trace.kind.is_delegate() { node.trace.caller } else { node.trace.address }
+    if matches!(node.trace.kind, CallKind::DelegateCall | CallKind::CallCode) {
+        node.trace.caller
+    } else {
+        node.trace.address
+    }
 }
 
 fn opcode_from_name(name: &str) -> Option<OpCode> {
@@ -799,7 +819,7 @@ mod tests {
             ..Default::default()
         };
 
-        let converted = build_rpc_trace_arena(&root, &DefaultFrame::default(), false);
+        let converted = build_rpc_trace_arena(&root, &DefaultFrame::default(), false, 5);
         let nodes = converted.arena.nodes();
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].children, vec![1]);
@@ -848,7 +868,7 @@ mod tests {
             ..Default::default()
         };
 
-        let converted = build_rpc_trace_arena(&root, &frame, true);
+        let converted = build_rpc_trace_arena(&root, &frame, true, 5);
         assert!(converted.warnings.is_empty());
         assert_eq!(converted.arena.nodes()[0].trace.steps.len(), 2);
         assert_eq!(converted.arena.nodes()[0].trace.steps[0].op, OpCode::SLOAD);
@@ -871,7 +891,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut converted = build_rpc_trace_arena(&root, &DefaultFrame::default(), false);
+        let mut converted = build_rpc_trace_arena(&root, &DefaultFrame::default(), false, 5);
         let mut warnings = converted.warnings.clone();
         finalize_rpc_trace_arena(&mut converted.arena.arena, 7, &mut warnings);
 
@@ -912,7 +932,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut converted = build_rpc_trace_arena(&root, &frame, false);
+        let mut converted = build_rpc_trace_arena(&root, &frame, false, 5);
         let node = &mut converted.arena.nodes_mut()[0];
         node.trace.steps[0].decoded = Some(Box::new(DecodedTraceStep::InternalCall(
             DecodedInternalCall { func_name: "foo".to_string(), args: None, return_data: None },
@@ -925,6 +945,65 @@ mod tests {
         assert!(warnings.iter().any(|warning| {
             warning.contains("internal frame 'foo' gasUsed (20) exceeds enclosing call gasUsed (5)")
         }));
+    }
+
+    #[test]
+    fn gas_between_steps_prefers_gas_remaining_delta() {
+        let start = CallTraceStep {
+            pc: 0,
+            op: OpCode::STOP,
+            stack: None,
+            push_stack: None,
+            memory: None,
+            returndata: Bytes::new(),
+            gas_remaining: 100,
+            gas_refund_counter: 0,
+            gas_used: 10,
+            gas_cost: 0,
+            storage_change: None,
+            status: None,
+            immediate_bytes: None,
+            decoded: None,
+        };
+        let end = CallTraceStep {
+            pc: 1,
+            op: OpCode::STOP,
+            stack: None,
+            push_stack: None,
+            memory: None,
+            returndata: Bytes::new(),
+            gas_remaining: 73,
+            gas_refund_counter: 0,
+            gas_used: 999,
+            gas_cost: 0,
+            storage_change: None,
+            status: None,
+            immediate_bytes: None,
+            decoded: None,
+        };
+
+        assert_eq!(gas_between_steps(&start, &end), 27);
+    }
+
+    #[test]
+    fn rpc_step_gas_used_respects_pre_london_refund_cap() {
+        assert_eq!(rpc_step_gas_used(100, 40, 50, 5), 48);
+        assert_eq!(rpc_step_gas_used(100, 40, 50, 2), 30);
+    }
+
+    #[test]
+    fn storage_address_uses_caller_for_callcode() {
+        let node = CallTraceNode {
+            trace: CallTrace {
+                caller: address!("0000000000000000000000000000000000000001"),
+                address: address!("0000000000000000000000000000000000000002"),
+                kind: CallKind::CallCode,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(storage_address(&node), node.trace.caller);
     }
 
     #[test]
@@ -955,7 +1034,8 @@ mod tests {
             ..Default::default()
         };
 
-        let mut local = build_rpc_trace_arena(&root, &DefaultFrame::default(), false).arena.arena;
+        let mut local =
+            build_rpc_trace_arena(&root, &DefaultFrame::default(), false, 5).arena.arena;
         local.nodes_mut()[0].children.swap(0, 1);
         local.nodes_mut()[0].trace.steps.push(CallTraceStep {
             pc: 1,
@@ -999,7 +1079,8 @@ mod tests {
             input: bytes!("abcdef01"),
             ..Default::default()
         };
-        let local = build_rpc_trace_arena(&local_root, &DefaultFrame::default(), false).arena.arena;
+        let local =
+            build_rpc_trace_arena(&local_root, &DefaultFrame::default(), false, 5).arena.arena;
 
         assert!(graft_local_replay_onto_call_tracer(&remote, &local).is_none());
     }
