@@ -592,12 +592,12 @@ rexpect = { git = "https://github.com/rust-cli/rexpect", rev = "2ed0b1898d7edaf6
 # reth-rpc-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "af2174c" }
 
 ## op-alloy / alloy-op-evm
-op-alloy-consensus = { git = "https://github.com/foundry-rs/optimism", branch = "develop" }
-op-alloy-network = { git = "https://github.com/foundry-rs/optimism", branch = "develop" }
-op-alloy-rpc-types = { git = "https://github.com/foundry-rs/optimism", branch = "develop" }
-op-alloy = { git = "https://github.com/foundry-rs/optimism", branch = "develop" }
-alloy-op-evm = { git = "https://github.com/foundry-rs/optimism", branch = "develop" }
-alloy-op-hardforks = { git = "https://github.com/foundry-rs/optimism", branch = "develop" }
+op-alloy-consensus = { git = "https://github.com/foundry-rs/optimism", rev = "0dc3c00bd1b3b2976f53503ba92fe84c602deca6" }
+op-alloy-network = { git = "https://github.com/foundry-rs/optimism", rev = "0dc3c00bd1b3b2976f53503ba92fe84c602deca6" }
+op-alloy-rpc-types = { git = "https://github.com/foundry-rs/optimism", rev = "0dc3c00bd1b3b2976f53503ba92fe84c602deca6" }
+op-alloy = { git = "https://github.com/foundry-rs/optimism", rev = "0dc3c00bd1b3b2976f53503ba92fe84c602deca6" }
+alloy-op-evm = { git = "https://github.com/foundry-rs/optimism", rev = "0dc3c00bd1b3b2976f53503ba92fe84c602deca6" }
+alloy-op-hardforks = { git = "https://github.com/foundry-rs/optimism", rev = "0dc3c00bd1b3b2976f53503ba92fe84c602deca6" }
 
 ## revm
 # revm = { git = "https://github.com/bluealloy/revm.git", rev = "7e59936" }
