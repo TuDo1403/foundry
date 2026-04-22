@@ -33,22 +33,16 @@ env:
   DEFAULT_RUST_FEATURES: aws-kms,gcp-kms,turnkey,cli,asm-keccak,js-tracer
 
 jobs:
-  docker:
-    name: build and push
+  vars:
+    name: resolve build inputs
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      profile: ${{ steps.vars.outputs.profile }}
+      features: ${{ steps.vars.outputs.features }}
+      image_name: ${{ steps.vars.outputs.image_name }}
+      build_date: ${{ steps.vars.outputs.build_date }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-qemu-action@v3
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Resolve build inputs
         id: vars
         shell: bash
@@ -80,21 +74,100 @@ jobs:
             printf 'build_date=%s\n' "$BUILD_DATE"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push image
+  build:
+    name: build and push (${{ matrix.platform_slug }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: vars
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            platform_slug: amd64
+          - platform: linux/arm64
+            platform_slug: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.vars.outputs.image_name }}:${{ steps.vars.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ steps.vars.outputs.image_name }}:sha-${{ github.sha }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.vars.outputs.image_name }},name-canonical=true,push-by-digest=true,push=true
           build-args: |
-            RUST_PROFILE=${{ steps.vars.outputs.profile }}
-            RUST_FEATURES=${{ steps.vars.outputs.features }}
-            TAG_NAME=${{ steps.vars.outputs.tag }}
+            RUST_PROFILE=${{ needs.vars.outputs.profile }}
+            RUST_FEATURES=${{ needs.vars.outputs.features }}
+            TAG_NAME=${{ needs.vars.outputs.tag }}
             VERGEN_GIT_SHA=${{ github.sha }}
-            BUILD_DATE=${{ steps.vars.outputs.build_date }}
+            BUILD_DATE=${{ needs.vars.outputs.build_date }}
             VCS_REF=${{ github.sha }}
-            VERSION=${{ steps.vars.outputs.tag }}
+            VERSION=${{ needs.vars.outputs.tag }}
+
+      - name: Export digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform_slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge multi-arch manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+      - vars
+      - build
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Create manifest list
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ env.REGISTRY }}/${{ needs.vars.outputs.image_name }}"
+          refs=()
+          for f in /tmp/digests/*; do
+            refs+=("${IMAGE}@sha256:$(basename "$f")")
+          done
+
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ needs.vars.outputs.tag }}" \
+            -t "${IMAGE}:sha-${{ github.sha }}" \
+            "${refs[@]}"
